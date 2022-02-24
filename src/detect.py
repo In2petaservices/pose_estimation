@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 
 import os
+from this import d
+from cv2 import KeyPoint
+from matplotlib import image
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
-
+import triangulation as tri
+import calibration
 # Python imports
 import numpy as np
 import cv2
+import math
+import message_filters
 from geometry_msgs.msg import TransformStamped
 import tf2_ros
 import tf
@@ -22,12 +28,12 @@ from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Point32, Polygon
 from numpy import random
 from rospkg import RosPack
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image ,LaserScan
 from skimage.transform import resize
 from std_msgs.msg import UInt8
 from torch.autograd import Variable
 from yolov5_pytorch_ros.msg import BoundingBox, BoundingBoxes
-
+from math import nan
 from models.experimental import attempt_load
 from utils.datasets import LoadImages, LoadStreams
 from utils.general import (apply_classifier, check_img_size,
@@ -110,7 +116,9 @@ class Detector:
         if self.device.type != 'cpu':
             self.model(torch.zeros(1, 3, self.network_img_size, self.network_img_size).to(
                 self.device).type_as(next(self.model.parameters())))  # run once
-        self.K=[203.42144086256206, 0.0, 206.12517266886093, 0.0, 203.55319738398958, 146.4392791209304, 0.0, 0.0, 1.0]
+        self.K=[203.42144086256206, 0.0, 206.12517266886093, 
+                0.0, 203.55319738398958, 146.4392791209304, 
+                0.0, 0.0, 1.0]
         t = 0
         self.camera_parameters=np.array([[0,0,0],[0,0,0],[0,0,0]])
         for i in range(3):
@@ -128,10 +136,14 @@ class Detector:
         self.published_image_topic = rospy.get_param('~detections_image_topic')
 
         # Define subscribers
-        self.image_sub = rospy.Subscriber(
-            self.image_topic, Image, self.image_cb, queue_size=1, buff_size=2**24)
-        self.image_sub = rospy.Subscriber(
-            self.image_topic, Image, self.image_cb, queue_size=1, buff_size=2**24)
+        self.image_sub = message_filters.Subscriber(
+            self.image_topic, Image)
+        self.image_bub2 = message_filters.Subscriber(
+            "/scan", LaserScan)
+        self.image_bub = message_filters.Subscriber(
+            "/camera2/image_raw", Image)
+        ts = message_filters.ApproximateTimeSynchronizer([self.image_sub, self.image_bub2,self.image_bub],  1, 1)
+        ts.registerCallback(self.image_cb)
         # Define publishers
         self.pub_ = rospy.Publisher(
             self.detected_objects_topic, BoundingBoxes, queue_size=10)
@@ -141,6 +153,9 @@ class Detector:
 
         # Spin
         rospy.spin()
+    def lidar_cb(self,data):
+        self.ranges=data
+
     def pubTf(self,position, orientation):
         """
         publish find object to tf2
@@ -150,8 +165,8 @@ class Detector:
         """
         global t
         t.header.stamp = rospy.Time.now()
-        t.header.frame_id = topic_tf_perent
-        t.child_frame_id = topic_tf_child
+        t.header.frame_id = "/base_link"
+        t.child_frame_id = "/object"
         t.transform.translation.x = position[0]
         t.transform.translation.y = position[1]
         t.transform.translation.z = position[2]
@@ -169,31 +184,50 @@ class Detector:
         retval, rotation, translation = cv2.solvePnP(object_points, image_points, camera_parameters,
                                                      camera_distortion_param)
         return rotation, translation
-    def image_cb(self, data):
+    def image_cb(self, data,data2,data3):
         # Convert the image to OpenCV
+        self.ranges=data2.ranges
         try:
             self.cv_img = self.bridge.imgmsg_to_cv2(data, "rgb8")
         except CvBridgeError as e:
             print(e)
+        try:
+            self.cv_img2 = self.bridge.imgmsg_to_cv2(data3, "rgb8")
+        except CvBridgeError as e:
+            print(e)
         # Initialize detection results
-
+        B = 9
+        f=10 
         detection_results = BoundingBoxes()
         detection_results.header = data.header
         detection_results.image_header = data.header
+        
         input_img = self.preprocess(self.cv_img)
+        input_img2 = self.preprocess(self.cv_img2)
         #input_img = Variable(input_img.type(torch.FloatTensor))
+        #input_img2 = Variable(input_img2.type(torch.FloatTensor))
 
         # Get detections from network
         with torch.no_grad():
             input_img = torch.from_numpy(input_img).to(self.device,dtype=torch.half)
+            input_img2 = torch.from_numpy(input_img2).to(self.device,dtype=torch.half)
             detections = self.model(input_img)[0]
+            detections2 = self.model(input_img2)[0]
             detections = non_max_suppression(detections, self.conf_thres, self.iou_thres,
                                              classes=self.classes, agnostic=self.agnostic_nms)
-            
+            detections2 = non_max_suppression(detections2, self.conf_thres, self.iou_thres,
+                                             classes=self.classes, agnostic=self.agnostic_nms)
+        alpha = 127.22339616    
         # Parse detections
+        i=0
+        strq='a'
         if detections[0] is not None:
             for detection in detections[0]:
-                
+                kp=0.5
+                try:
+                    xmin2, ymin2, xmax2, ymax2, conf2, det_class2=detections2[0][i]
+                except:
+                    pass
                 # Get xmin, ymin, xmax, ymax, confidence and class
                 xmin, ymin, xmax, ymax, conf, det_class = detection
         
@@ -213,6 +247,30 @@ class Detector:
                 xmax_unpad = xmax_unpad.cpu().detach().numpy()
                 ymin_unpad =  ymin_unpad.cpu().detach().numpy()
                 ymax_unpad = ymax_unpad.cpu().detach().numpy()
+                pad_x2 = max(self.h - self.w, 0) * \
+                    (self.network_img_size/max(self.h, self.w))
+                pad_y2 = max(self.w - self.h, 0) * \
+                   (self.network_img_size/max(self.h, self.w))
+                unpad_h2 = self.network_img_size-pad_y2
+                unpad_w2 = self.network_img_size-pad_x2
+                try:
+                    xmin_unpad2 = ((xmin2-pad_x2//2)/unpad_w2)*self.w
+                    xmax_unpad2 = ((xmax2-xmin2)/unpad_w2)*self.w + xmin_unpad2
+                    ymin_unpad2 = ((ymin2-pad_y2//2)/unpad_h2)*self.h
+                    ymax_unpad2 = ((ymax2-ymin2)/unpad_h2)*self.h + ymin_unpad2
+                    xmin_unpad2 = xmin_unpad2.cpu().detach().numpy()
+                    xmax_unpad2 = xmax_unpad2.cpu().detach().numpy()
+                    ymin_unpad2 =  ymin_unpad2.cpu().detach().numpy()
+                    ymax_unpad2 = ymax_unpad2.cpu().detach().numpy()
+                    center_point_right=((xmin_unpad2-xmax_unpad2//2),(ymin_unpad2-ymax_unpad2//2))
+                    center_point=((xmin_unpad-xmax_unpad//2),(ymin_unpad-ymax_unpad//2))
+                    frame_right, frame_left = calibration.undistortRectify(self.cv_img, self.cv_img2)
+                    depth2 = tri.find_depth(center_point_right, center_point, frame_right, frame_left, B, f, alpha)
+                    depth2=depth2/20
+                except:
+                    kp=0
+                    depth2=0
+                    pass
                 # Populate darknet message
                 detection_msg = BoundingBox()
                 detection_msg.xmin = int(xmin_unpad)
@@ -221,22 +279,40 @@ class Detector:
                 detection_msg.ymax = int(ymax_unpad)
                 detection_msg.probability = float(conf)
                 detection_msg.Class = self.names[int(det_class)]
-                object=np.array([[xmin_unpad,ymin_unpad,0],
-                                [xmax_unpad,ymin_unpad,0],
-                                [xmin_unpad,ymax_unpad,0],
-                                [xmax_unpad,ymax_unpad,0]],dtype=np.float64)
-                image=np.array([[xmin_unpad,ymin_unpad],
-                                [xmax_unpad,ymin_unpad],
-                                [xmin_unpad,ymax_unpad],
-                                [xmax_unpad,ymax_unpad]],dtype=np.float32)
-                rotation_rad, translation = self.iterative_solve_pnp(object,image,
-                                                                     self.camera_parameters,
-                                                                     self.camera_distortion_param)
                 
-                w=((xmax.cpu().detach().numpy()-xmin.cpu().detach().numpy())/640)
-                print(w)
-                translation= w*translation
-                self.pubTf(translation,rotation_rad)
+                angle=(2.22/408)*((xmin_unpad-xmax_unpad)//2)
+                index=int((angle+0.462)//0.014032435603439808)
+                depth=self.ranges[index]
+                depth=depth*-1
+                depth2=depth2*-1
+                
+                
+                if depth==nan:
+                    depth=0
+                fx=203.42144086256206
+                fy=203.55319738398958
+                rotation_rad=[0,0,0]
+                cx=206.12517266886093
+                cy=146.4392791209304
+                kn=1-kp
+                depth=kn*depth+kp*depth2
+                print(depth," ",depth2)
+                t = TransformStamped()
+                tf2_br = tf2_ros.TransformBroadcaster()
+                t.header.stamp = rospy.Time.now()
+                t.header.frame_id = "/base_link"
+                t.child_frame_id = "/object"+strq
+                strq+='a'
+                t.transform.translation.x = depth
+                t.transform.translation.y = (depth) * (((410-(xmax_unpad-xmin_unpad//2))-cx)/fx)
+                t.transform.translation.z = (depth) * (((308-(ymax_unpad-ymin_unpad//2))-cy)/fy)
+                quaternion = tf.transformations.quaternion_from_euler(0, 0, 0)
+
+                t.transform.rotation.x = quaternion[0]
+                t.transform.rotation.y = quaternion[1]
+                t.transform.rotation.z = quaternion[2]
+                t.transform.rotation.w = quaternion[3]
+                tf2_br.sendTransform(t)
                 # Append in overall detection message
                 detection_results.bounding_boxes.append(detection_msg)
 
@@ -300,6 +376,7 @@ class Detector:
             cv2.rectangle(imgOut, (int(x_p1), int(y_p1)), (int(x_p3), int(
                 y_p3)), (color[0], color[1], color[2]), thickness)
             text = ('{:s}: {:.3f}').format(label, confidence)
+            
             cv2.putText(imgOut, text, (int(x_p1), int(y_p1+20)), font,
                         fontScale, (255, 255, 255), thickness, cv2.LINE_AA)
 

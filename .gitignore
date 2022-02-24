@@ -1,0 +1,7 @@
+*.pyc
+*.weights
+*.swp
+weights/
+bag/
+
+

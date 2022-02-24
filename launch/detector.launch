@@ -2,7 +2,7 @@
 <launch>
 <node pkg="rviz" type="rviz" name="rviz"/>
 <node pkg="rosbag" type="play" name="rosbag_play" output="screen" required="true"
-         args="/home/nehalnevle/internship_int2peta/image_pose_ws/src/yolov5_pytorch_ros/bag/1st.bag"/>
+         args="/home/nehalnevle/internship_int2peta/image_pose_ws/src/yolov5_pytorch_ros/bag/2nd.bag"/>
     <!-- Camera topic and weights, config and classes files -->
     <arg name="image_topic"	                default="/camera1/image_raw"/>
     <arg name="weights_path"	            default="$(find yolov5_pytorch_ros)/weights/best.pt"/>
@@ -13,7 +13,7 @@
     <arg name="detections_image_topic"      default="detections_image_topic"/>
 
     <!-- Detection confidence -->
-    <arg name="confidence"                  default="0.25"/>
+    <arg name="confidence"                  default="0.10"/>
 
     <!-- Node -->
     <node name="detector" pkg="yolov5_pytorch_ros" type="detect.py" output="screen" respawn="true">
