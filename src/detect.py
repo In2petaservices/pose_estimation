@@ -48,6 +48,14 @@ package = RosPack()
 package_path = package.get_path('yolov5_pytorch_ros')
 topic_tf_child = "/object"
 topic_tf_perent = "/base_link"
+P = np.array([[0,0,0,0],
+            [0,0,0,0],
+            [0,0,0,0],
+            [0,0,0,0]])
+x_hat=None
+
+prev=[0,0]
+intila=0
 t = TransformStamped()
 tf2_br = tf2_ros.TransformBroadcaster()
 
@@ -69,7 +77,28 @@ class Detector:
         rospy.loginfo(log_str)
 
         self.conf_thres = rospy.get_param('~confidence', 0.25)
-
+        self.C=np.array([[1,0,1,0],
+                            [0,1,0,1],
+                            [0,0,0,0],
+                            [0,0,0,0]])
+        self.B=np.array([0,0,0,0])
+        dt=0.2
+        self.A=np.array([[1.0 ,0, dt,0],
+                        [0,1.0,0,dt],
+                        [0,0,1,0],
+                        [0,0,0,1]])
+        self.Q=np.array([[1.0,0,0,0],
+                        [0,1.0,0,0],
+                        [0,0,0.1,0],
+                        [0,0,0,0.1]])
+        self.R=np.array([[0.1,0,1,0],
+                            [0,0.1,0,1],
+                            [0,0,0.1,0],
+                            [0,0,0,0.1]])
+        self.I=np.array([[1,0,0,0],
+                        [0,1,0,0],
+                        [0,0,1,0],
+                        [0,0,0,1]])
         # Load other parameters
         self.device_name = ''
         self.device = select_device(self.device_name)
@@ -179,12 +208,29 @@ class Detector:
 
         tf2_br.sendTransform(t)
 
-    def iterative_solve_pnp(self, object_points, image_points, camera_parameters, camera_distortion_param):
-        image_points = image_points.reshape(-1, 2)
-        retval, rotation, translation = cv2.solvePnP(object_points, image_points, camera_parameters,
-                                                     camera_distortion_param)
-        return rotation, translation
+    def kalamnFilter(self, v):
+        global intila
+        global P
+        
+        
+        v=np.array(v)
+        if intila==0:
+            x_hat = v
+            prev = v[0:1]
+            intila=1
+        else:
+            
+            K = P*self.C.transpose()*(self.C*P*self.C.transpose() + self.R).inverse()
+            x_hat += K * (v - self.C*x_hat)
+            x_hat = self.A*x_hat
+            P = self.A*P*self.A.transpose() + self.Q
+            P = (self.I - K*self.C)*P
+            return x_hat
+
+        return x_hat
     def image_cb(self, data,data2,data3):
+        global prev
+
         # Convert the image to OpenCV
         self.ranges=data2.ranges
         try:
@@ -196,7 +242,7 @@ class Detector:
         except CvBridgeError as e:
             print(e)
         # Initialize detection results
-        B = 9
+        B = 5
         f=10 
         detection_results = BoundingBoxes()
         detection_results.header = data.header
@@ -223,7 +269,7 @@ class Detector:
         strq='a'
         if detections[0] is not None:
             for detection in detections[0]:
-                kp=0.5
+                kp=0.2
                 try:
                     xmin2, ymin2, xmax2, ymax2, conf2, det_class2=detections2[0][i]
                 except:
@@ -266,7 +312,7 @@ class Detector:
                     center_point=((xmin_unpad-xmax_unpad//2),(ymin_unpad-ymax_unpad//2))
                     frame_right, frame_left = calibration.undistortRectify(self.cv_img, self.cv_img2)
                     depth2 = tri.find_depth(center_point_right, center_point, frame_right, frame_left, B, f, alpha)
-                    depth2=depth2/20
+                    depth2=depth2/10
                 except:
                     kp=0
                     depth2=0
@@ -282,30 +328,34 @@ class Detector:
                 
                 angle=(2.22/408)*((xmin_unpad-xmax_unpad)//2)
                 index=int((angle+0.462)//0.014032435603439808)
-                depth=self.ranges[index]
-                depth=depth*-1
-                depth2=depth2*-1
+                depth1=self.ranges[index]
                 
+                if depth2<0:
+                    depth2=depth2*-1
                 
-                if depth==nan:
-                    depth=0
+                if depth1==nan:
+                    depth1=0
                 fx=203.42144086256206
                 fy=203.55319738398958
                 rotation_rad=[0,0,0]
                 cx=206.12517266886093
                 cy=146.4392791209304
                 kn=1-kp
-                depth=kn*depth+kp*depth2
-                print(depth," ",depth2)
+                depth=kn*depth1+kp*depth2
+                
+                v=([depth,(depth) * (((410-(xmax_unpad-xmin_unpad//2))-cx)/fx),prev[0]-depth,prev[1]-(((410-(xmax_unpad-xmin_unpad//2))-cx)/fx)])
+                prev=[depth,(depth) * (((410-(xmax_unpad-xmin_unpad//2))-cx)/fx)]
+                v_out=(v)
+                print("lidar:",depth1," stereo",depth2," fused:",depth,"kalman out:",v_out[1])
                 t = TransformStamped()
                 tf2_br = tf2_ros.TransformBroadcaster()
                 t.header.stamp = rospy.Time.now()
                 t.header.frame_id = "/base_link"
                 t.child_frame_id = "/object"+strq
                 strq+='a'
-                t.transform.translation.x = depth
-                t.transform.translation.y = (depth) * (((410-(xmax_unpad-xmin_unpad//2))-cx)/fx)
-                t.transform.translation.z = (depth) * (((308-(ymax_unpad-ymin_unpad//2))-cy)/fy)
+                t.transform.translation.x = v_out[0]
+                t.transform.translation.y = v_out[1]
+                t.transform.translation.z = 0
                 quaternion = tf.transformations.quaternion_from_euler(0, 0, 0)
 
                 t.transform.rotation.x = quaternion[0]
