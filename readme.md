@@ -24,3 +24,6 @@ We added a simple avreaging of the depth values from stereo camera and lidar we 
 
 Our mapping was done by 
 taking the FOV of the camera and then calulating the angle od detection and then the absolute angle by adding to the camera start angle from the horizontal.
+we calculated fov = 2arctan(x/2f)
+then we use simple geometery to calculate the angle detected this was then converted to index by using the angle/angle_diffrence.
+<img src="1.png"/>
