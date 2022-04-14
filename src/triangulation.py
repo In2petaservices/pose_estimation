@@ -12,7 +12,7 @@ def find_depth(right_point, left_point, frame_right, frame_left, baseline,f, alp
     
 
     
-    f_pixel = 203.42144086256206
+    f_pixel = 203.55319738398958
 
   
         

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
 import os
+from tarfile import XHDTYPE
 from this import d
 from cv2 import KeyPoint
 from matplotlib import image
-
+import csv
+import statistics
+import image_processing
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
 import triangulation as tri
@@ -17,6 +20,8 @@ import message_filters
 from geometry_msgs.msg import TransformStamped
 import tf2_ros
 import tf
+from utils_ds.parser import get_config
+from utils_ds.draw import draw_boxes
 # ROS imports
 import rospy
 import scipy.io as sio
@@ -39,26 +44,28 @@ from utils.datasets import LoadImages, LoadStreams
 from utils.general import (apply_classifier, check_img_size,
                            check_requirements, increment_path,
                            non_max_suppression, scale_coords, set_logging,
-                           strip_optimizer)
+                           strip_optimizer, xyxy2xywh)
 from utils.plots import plot_one_box
 # util + model imports
 from utils.torch_utils import load_classifier, select_device, time_synchronized
-
+from deep_sort import build_tracker
+from centroidtracker import CentroidTracker
 package = RosPack()
 package_path = package.get_path('yolov5_pytorch_ros')
 topic_tf_child = "/object"
 topic_tf_perent = "/base_link"
-P = np.array([[0,0,0,0],
+P = np.matrix([[0,0,0,0],
             [0,0,0,0],
             [0,0,0,0],
             [0,0,0,0]])
 x_hat=None
-
+u=0
 prev=[0,0]
 intila=0
+n=0
 t = TransformStamped()
 tf2_br = tf2_ros.TransformBroadcaster()
-
+error_sum=0
 class Detector:
     def __init__(self):
         # Load weights parameter
@@ -77,25 +84,25 @@ class Detector:
         rospy.loginfo(log_str)
 
         self.conf_thres = rospy.get_param('~confidence', 0.25)
-        self.C=np.array([[1,0,1,0],
+        self.C=np.matrix([[1,0,1,0],
                             [0,1,0,1],
                             [0,0,0,0],
                             [0,0,0,0]])
         self.B=np.array([0,0,0,0])
         dt=0.2
-        self.A=np.array([[1.0 ,0, dt,0],
+        self.A=np.matrix([[1.0 ,0, dt,0],
                         [0,1.0,0,dt],
                         [0,0,1,0],
                         [0,0,0,1]])
-        self.Q=np.array([[1.0,0,0,0],
+        self.Q=np.matrix([[1.0,0,0,0],
                         [0,1.0,0,0],
                         [0,0,0.1,0],
                         [0,0,0,0.1]])
-        self.R=np.array([[0.1,0,1,0],
+        self.R=np.matrix([[0.1,0,1,0],
                             [0,0.1,0,1],
                             [0,0,0.1,0],
                             [0,0,0,0.1]])
-        self.I=np.array([[1,0,0,0],
+        self.I=np.matrix([[1,0,0,0],
                         [0,1,0,0],
                         [0,0,1,0],
                         [0,0,0,1]])
@@ -113,7 +120,10 @@ class Detector:
 
         self.w = 0
         self.h = 0
-
+        cfg = get_config()
+        self.deepsort = build_tracker()
+        cfg = get_config()
+        self.deepsort2 = build_tracker()
         # Second-stage classifier
         self.classify = False
 
@@ -143,6 +153,7 @@ class Detector:
 
         # Run inference
         if self.device.type != 'cpu':
+            print(self.model)
             self.model(torch.zeros(1, 3, self.network_img_size, self.network_img_size).to(
                 self.device).type_as(next(self.model.parameters())))  # run once
         self.K=[203.42144086256206, 0.0, 206.12517266886093, 
@@ -211,7 +222,8 @@ class Detector:
     def kalamnFilter(self, v):
         global intila
         global P
-        
+        global x_hat
+
         
         v=np.array(v)
         if intila==0:
@@ -220,9 +232,11 @@ class Detector:
             intila=1
         else:
             
-            K = P*self.C.transpose()*(self.C*P*self.C.transpose() + self.R).inverse()
-            x_hat += K * (v - self.C*x_hat)
-            x_hat = self.A*x_hat
+            K = P*self.C.transpose()*(self.C*P*self.C.transpose() + self.R).I
+            j=np.multiply(x_hat,self.C)
+            a=np.multiply(K.transpose(),np.matrix(v - j))
+            x_hat = x_hat + a
+            x_hat = x_hat*self.A.transpose()
             P = self.A*P*self.A.transpose() + self.Q
             P = (self.I - K*self.C)*P
             return x_hat
@@ -230,8 +244,11 @@ class Detector:
         return x_hat
     def image_cb(self, data,data2,data3):
         global prev
-
-        # Convert the image to OpenCV
+        global error_sum
+        global n
+        
+        f = open('/home/nehalnevle/test3.csv', 'a')
+        writer = csv.writer(f)
         self.ranges=data2.ranges
         try:
             self.cv_img = self.bridge.imgmsg_to_cv2(data, "rgb8")
@@ -242,8 +259,8 @@ class Detector:
         except CvBridgeError as e:
             print(e)
         # Initialize detection results
-        B = 5
-        f=10 
+        B = 50
+        
         detection_results = BoundingBoxes()
         detection_results.header = data.header
         detection_results.image_header = data.header
@@ -261,45 +278,101 @@ class Detector:
             detections2 = self.model(input_img2)[0]
             detections = non_max_suppression(detections, self.conf_thres, self.iou_thres,
                                              classes=self.classes, agnostic=self.agnostic_nms)
+            det1 = detections[0]
             detections2 = non_max_suppression(detections2, self.conf_thres, self.iou_thres,
                                              classes=self.classes, agnostic=self.agnostic_nms)
+            det2=detections2[0]
+            
         alpha = 127.22339616    
         # Parse detections
         i=0
-        strq='a'
+        ct = CentroidTracker()
+        j=1
+        rects=[]
+        
         if detections[0] is not None:
-            for detection in detections[0]:
+            bbox_xywh1 = xyxy2xywh(det1[:,0:4]).cpu()
+            confs1 = det1[:, 4:5].cpu()
+            bbox_xywh2 = xyxy2xywh(det2[:,0:4]).cpu()
+            confs2 = det2[:, 4:5].cpu()
+            try:
+                outputs = self.deepsort.update(bbox_xywh1, confs1, self.cv_img)
+                outputs2 = self.deepsort2.update(bbox_xywh2, confs2, self.cv_img2)
+            
+            
+                bbox_xyxy2 = outputs2[:][0:4]
+                
+                bbox_xyxy = outputs[:][0:4]
+            except:
+                pass
+
+            for i in range(len(detections[0])):
                 kp=0.2
                 try:
-                    xmin2, ymin2, xmax2, ymax2, conf2, det_class2=detections2[0][i]
+                    
+                    xmin2, ymin2, xmax2, ymax2,w2=bbox_xyxy2[i]
+                    
                 except:
                     pass
                 # Get xmin, ymin, xmax, ymax, confidence and class
-                xmin, ymin, xmax, ymax, conf, det_class = detection
-        
+                xmin, ymin, xmax, ymax, conf, det_class = detections[0][i]
+                try:
+                    xmin, ymin, xmax, ymax,w=bbox_xyxy[i]
+                except:
+                    pass
                 if self.names[int(det_class)] not in ['bin_rect','bin_side','bin_cir']:
                     continue
-                pad_x = max(self.h - self.w, 0) * \
-                    (self.network_img_size/max(self.h, self.w))
-                pad_y = max(self.w - self.h, 0) * \
-                    (self.network_img_size/max(self.h, self.w))
-                unpad_h = self.network_img_size-pad_y
-                unpad_w = self.network_img_size-pad_x
-                xmin_unpad = ((xmin-pad_x//2)/unpad_w)*self.w
-                xmax_unpad = ((xmax-xmin)/unpad_w)*self.w + xmin_unpad
-                ymin_unpad = ((ymin-pad_y//2)/unpad_h)*self.h
-                ymax_unpad = ((ymax-ymin)/unpad_h)*self.h + ymin_unpad
-                xmin_unpad = xmin_unpad.cpu().detach().numpy()
-                xmax_unpad = xmax_unpad.cpu().detach().numpy()
-                ymin_unpad =  ymin_unpad.cpu().detach().numpy()
-                ymax_unpad = ymax_unpad.cpu().detach().numpy()
-                pad_x2 = max(self.h - self.w, 0) * \
-                    (self.network_img_size/max(self.h, self.w))
-                pad_y2 = max(self.w - self.h, 0) * \
-                   (self.network_img_size/max(self.h, self.w))
-                unpad_h2 = self.network_img_size-pad_y2
-                unpad_w2 = self.network_img_size-pad_x2
                 try:
+                    pad_x = max(self.h - self.w, 0) * \
+                        (self.network_img_size/max(self.h, self.w))
+                    pad_y = max(self.w - self.h, 0) * \
+                        (self.network_img_size/max(self.h, self.w))
+                    unpad_h = self.network_img_size-pad_y
+                    unpad_w = self.network_img_size-pad_x
+                    xmin_unpad = ((xmin-pad_x//2)/unpad_w)*self.w
+                    xmax_unpad = ((xmax-xmin)/unpad_w)*self.w + xmin_unpad
+                    ymin_unpad = ((ymin-pad_y//2)/unpad_h)*self.h
+                    ymax_unpad = ((ymax-ymin)/unpad_h)*self.h + ymin_unpad
+                    xmin_unpad = xmin_unpad.cpu().detach().numpy()
+                    xmax_unpad = xmax_unpad.cpu().detach().numpy()
+                    ymin_unpad =  ymin_unpad.cpu().detach().numpy()
+                    ymax_unpad = ymax_unpad.cpu().detach().numpy()
+                    pad_x2 = max(self.h - self.w, 0) * \
+                        (self.network_img_size/max(self.h, self.w))
+                    pad_y2 = max(self.w - self.h, 0) * \
+                    (self.network_img_size/max(self.h, self.w))
+                    unpad_h2 = self.network_img_size-pad_y2
+                    unpad_w2 = self.network_img_size-pad_x2
+                    rects.append([xmin_unpad, ymin_unpad, xmax_unpad, ymax_unpad])
+                except:
+                    pass
+                
+                try:
+                    pad_x = max(self.h - self.w, 0) * \
+                        (self.network_img_size/max(self.h, self.w))
+                    pad_y = max(self.w - self.h, 0) * \
+                        (self.network_img_size/max(self.h, self.w))
+                    unpad_h = self.network_img_size-pad_y
+                    unpad_w = self.network_img_size-pad_x
+                    xmin_unpad = ((xmin-pad_x//2)/unpad_w)*self.w
+                    xmax_unpad = ((xmax-xmin)/unpad_w)*self.w + xmin_unpad
+                    ymin_unpad = ((ymin-pad_y//2)/unpad_h)*self.h
+                    ymax_unpad = ((ymax-ymin)/unpad_h)*self.h + ymin_unpad
+                    xmin_unpad = xmin_unpad
+                    xmax_unpad = xmax_unpad
+                    ymin_unpad =  ymin_unpad
+                    ymax_unpad = ymax_unpad
+                    pad_x2 = max(self.h - self.w, 0) * \
+                        (self.network_img_size/max(self.h, self.w))
+                    pad_y2 = max(self.w - self.h, 0) * \
+                    (self.network_img_size/max(self.h, self.w))
+                    unpad_h2 = self.network_img_size-pad_y2
+                    unpad_w2 = self.network_img_size-pad_x2
+                    rects.append([xmin_unpad, ymin_unpad, xmax_unpad, ymax_unpad])
+                except:
+                    pass
+                try:
+                   
                     xmin_unpad2 = ((xmin2-pad_x2//2)/unpad_w2)*self.w
                     xmax_unpad2 = ((xmax2-xmin2)/unpad_w2)*self.w + xmin_unpad2
                     ymin_unpad2 = ((ymin2-pad_y2//2)/unpad_h2)*self.h
@@ -310,10 +383,35 @@ class Detector:
                     ymax_unpad2 = ymax_unpad2.cpu().detach().numpy()
                     center_point_right=((xmin_unpad2-xmax_unpad2//2),(ymin_unpad2-ymax_unpad2//2))
                     center_point=((xmin_unpad-xmax_unpad//2),(ymin_unpad-ymax_unpad//2))
+                    
                     frame_right, frame_left = calibration.undistortRectify(self.cv_img, self.cv_img2)
                     depth2 = tri.find_depth(center_point_right, center_point, frame_right, frame_left, B, f, alpha)
-                    depth2=depth2/10
-                except:
+                    depth2=depth2/100
+                    
+                except Exception as e:
+                    kp=0
+                    depth2=0
+                    pass
+                try:
+                    
+                    xmin_unpad2 = ((xmin2-pad_x2//2)/unpad_w2)*self.w
+                    xmax_unpad2 = ((xmax2-xmin2)/unpad_w2)*self.w + xmin_unpad2
+                    ymin_unpad2 = ((ymin2-pad_y2//2)/unpad_h2)*self.h
+                    ymax_unpad2 = ((ymax2-ymin2)/unpad_h2)*self.h + ymin_unpad2
+                    xmin_unpad2 = xmin_unpad2
+                    xmax_unpad2 = xmax_unpad2
+                    ymin_unpad2 =  ymin_unpad2
+                    ymax_unpad2 = ymax_unpad2
+                    center_point_right=((xmin_unpad2-xmax_unpad2//2),(ymin_unpad2-ymax_unpad2//2))
+                    center_point=((xmin_unpad-xmax_unpad//2),(ymin_unpad-ymax_unpad//2))
+                    
+                    frame_right, frame_left = calibration.undistortRectify(self.cv_img, self.cv_img2)
+                    depth2 = tri.find_depth(center_point_right, center_point, frame_right, frame_left, B, f, alpha)
+                
+                    depth2=depth2/100
+                    
+                except Exception as e:
+                    print(e)
                     kp=0
                     depth2=0
                     pass
@@ -326,9 +424,11 @@ class Detector:
                 detection_msg.probability = float(conf)
                 detection_msg.Class = self.names[int(det_class)]
                 
-                angle=(2.22/408)*((xmin_unpad-xmax_unpad)//2)
-                index=int((angle+0.462)//0.014032435603439808)
-                depth1=self.ranges[index]
+                angle1=(2.22/408)*(xmin_unpad)
+                index1=int((angle1+0.462)//0.014032435603439808)
+                angle2=(2.22/408)*(xmax_unpad)
+                index2=int((angle2+0.462)//0.014032435603439808)
+                depth1=statistics.mean(self.ranges[index1:index2])
                 
                 if depth2<0:
                     depth2=depth2*-1
@@ -340,23 +440,56 @@ class Detector:
                 rotation_rad=[0,0,0]
                 cx=206.12517266886093
                 cy=146.4392791209304
+                kp=0.2
                 kn=1-kp
+                try:
+                    depth2=depth2.cpu().detach().numpy()
+                except:
+                    pass
                 depth=kn*depth1+kp*depth2
-                
+                #depth=depth/2
                 v=([depth,(depth) * (((410-(xmax_unpad-xmin_unpad//2))-cx)/fx),prev[0]-depth,prev[1]-(((410-(xmax_unpad-xmin_unpad//2))-cx)/fx)])
+                print("diff;",prev[0]-depth)
+                if abs(prev[0]-depth)>5:
+                    depth=prev[0]
                 prev=[depth,(depth) * (((410-(xmax_unpad-xmin_unpad//2))-cx)/fx)]
+                v=([depth,(depth) * (((410-(xmax_unpad-xmin_unpad//2))-cx)/fx),prev[0]-depth,prev[1]-(((410-(xmax_unpad-xmin_unpad//2))-cx)/fx)])
                 v_out=(v)
-                print("lidar:",depth1," stereo",depth2," fused:",depth,"kalman out:",v_out[1])
+                strq=str(j)
+                error=v_out[0]-depth1
+                n+=1
+                if error==float('nan'):
+                    error=0
+                print(u)
+                _rate = 10.                 # this is a voracious application, so I recommend to lower the frequency, if it is not critical
+
+                MIN_MATCH_COUNT = 10        # the lower the value, the more sensitive the filter
+                blur_threshold = 300        # the higher the value, the more sensitive the filter
+                max_dist = 10. 
+                error_sum+=error**2
+                rms=(error_sum/n)**0.5
+                writer.writerow([depth1,depth2,depth,v_out[0]])
+                print("lidar:",depth1," stereo",depth2," fused:",depth,"kalman out:",v_out[0],"rms:",rms)
                 t = TransformStamped()
                 tf2_br = tf2_ros.TransformBroadcaster()
                 t.header.stamp = rospy.Time.now()
                 t.header.frame_id = "/base_link"
-                t.child_frame_id = "/object"+strq
-                strq+='a'
+                t.child_frame_id = "/object_"+strq
+                j+=1
+                size_image = 2.             # the width of the image in meters
+
+                use_image = False           # uses a known image
+                image_path = "image.jpg"    # path to known image
+
+                show_image = True
+                image_proc = image_processing.ImageEstimation(MIN_MATCH_COUNT, 300, use_image, size_image, image_path, show_image)
+                image_proc.max_dist = max_dist
+                frame, trans, rot = image_proc.update(self.cv_img, 0)
+                orientation = rot
                 t.transform.translation.x = v_out[0]
                 t.transform.translation.y = v_out[1]
                 t.transform.translation.z = 0
-                quaternion = tf.transformations.quaternion_from_euler(0, 0, 0)
+                quaternion = tf.transformations.quaternion_from_euler(orientation[0], orientation[1], orientation[2])
 
                 t.transform.rotation.x = quaternion[0]
                 t.transform.rotation.y = quaternion[1]
@@ -365,13 +498,14 @@ class Detector:
                 tf2_br.sendTransform(t)
                 # Append in overall detection message
                 detection_results.bounding_boxes.append(detection_msg)
-
+        objects = ct.update(rects)
+        
         # Publish detection results
         self.pub_.publish(detection_results)
-
+        f.close()
         # Visualize detection results
         if (self.publish_image):
-            self.visualize_and_publish(detection_results, self.cv_img)
+            self.visualize_and_publish(detection_results,objects, self.cv_img)
         return True
 
     def preprocess(self, img):
@@ -405,12 +539,22 @@ class Detector:
 
         return input_img
 
-    def visualize_and_publish(self, output, imgIn):
+    def visualize_and_publish(self, output,objects, imgIn):
+        global u
         # Copy image and visualize
         imgOut = imgIn.copy()
         font = cv2.FONT_HERSHEY_SIMPLEX
         fontScale = 0.8
         thickness = 2
+        
+        #for (objectID, centroid) in objects.items():
+            # draw both the ID of the object and the centroid of the
+            # object on the output frame
+            
+        #    text = "ID {}".format(objectID)
+        #    cv2.putText(imgOut, text, (centroid[0] - 10, centroid[1] - 10),
+        #        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        #    cv2.circle(imgOut, (centroid[0], centroid[1]), 4, (0, 255, 0), -1)
         for index in range(len(output.bounding_boxes)):
             label = output.bounding_boxes[index].Class
             x_p1 = output.bounding_boxes[index].xmin
@@ -421,7 +565,7 @@ class Detector:
 
             # Set class color
             color = self.colors[self.names.index(label)]
-
+            
             # Create rectangle
             cv2.rectangle(imgOut, (int(x_p1), int(y_p1)), (int(x_p3), int(
                 y_p3)), (color[0], color[1], color[2]), thickness)
@@ -429,7 +573,10 @@ class Detector:
             
             cv2.putText(imgOut, text, (int(x_p1), int(y_p1+20)), font,
                         fontScale, (255, 255, 255), thickness, cv2.LINE_AA)
-
+        if u<12:
+            print("done")
+            cv2.imwrite("/home/nehalnevle/test"+str(u)+".png",imgOut)
+        u+=0.2
         # Publish visualization image
         image_msg = self.bridge.cv2_to_imgmsg(imgOut, "rgb8")
         image_msg.header.frame_id = 'camera'
@@ -439,6 +586,11 @@ class Detector:
 
 if __name__ == '__main__':
     rospy.init_node('detector')
-
+    f = open("/home/nehalnevle/test3.csv", 'w')
+    # Convert the image to OpenCV
+    writer = csv.writer(f)
+    header = ['lidar', 'stereo', 'fused', 'kalman']
+    writer.writerow(header)
+    f.close()
     # Define detector object
     dm = Detector()
